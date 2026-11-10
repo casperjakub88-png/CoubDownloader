@@ -158,9 +158,9 @@ def scrape_channel_id(name):
     return match.group(1) if match else None
 
 
-def scrape_coub_page(permalink):
+def scrape_coub_page(permalink, token=None):
     """Read a single coub's data from its page (there is no public single-coub API)."""
-    html = fetch_text(f"{COUB_VIEW_URL}{permalink}")
+    html = fetch_text(f"{COUB_VIEW_URL}{permalink}", token=token)
 
     # Join all Next.js chunks; each chunk is an escaped JSON string
     stream = []
@@ -225,6 +225,8 @@ class DefaultOptions:
     ARCHIVE = None
     # Auth token (value of the sb-gotrue-auth-token cookie) for liked/bookmarks
     AUTH_TOKEN = None
+    # Permalink of the user's own channel (GUI convenience)
+    MY_CHANNEL = None
     # Output defaults
     MERGE_EXT = "mkv"
     NAME_TEMPLATE = "%id%"
@@ -257,8 +259,8 @@ class DefaultOptions:
             user_settings = []
 
         for setting in user_settings:
-            name = setting.split("=")[0].strip()
-            value = setting.split("=")[1].strip()
+            name = setting.split("=", 1)[0].strip()
+            value = setting.split("=", 1)[1].strip()
             if hasattr(self, name):
                 value = self.guess_string_type(name, value)
                 setattr(self, name, value)
@@ -285,6 +287,7 @@ class DefaultOptions:
             "AAC": (lambda x: x in [0, 1, 2, 3]),
             "SHARE": (lambda x: isinstance(x, bool)),
             "AUTH_TOKEN": (lambda x: isinstance(x, str) or x is None),
+            "MY_CHANNEL": (lambda x: isinstance(x, str) or x is None),
             "RECOUBS": (lambda x: x in [0, 1, 2]),
             "PREVIEW": (lambda x: isinstance(x, str) or x is None),
             "A_ONLY": (lambda x: isinstance(x, bool)),
@@ -328,6 +331,7 @@ class DefaultOptions:
             "OUTPUT_LIST",
             "ARCHIVE",
             "AUTH_TOKEN",
+            "MY_CHANNEL",
             "NAME_TEMPLATE",
             "FFMPEG_PATH",
             "TAG_SEP",
@@ -916,7 +920,8 @@ class Coub:
             return
 
         try:
-            data = scrape_coub_page(self.id)
+            data = scrape_coub_page(self.id,
+                                    token=getattr(opts, "auth_token", None))
         except (urllib.error.HTTPError, urllib.error.URLError):
             self.unavailable = True
             return

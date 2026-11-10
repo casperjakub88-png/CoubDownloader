@@ -18,11 +18,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import os
+import sys
 from textwrap import dedent
 
 from gooey import Gooey, GooeyParser
 
 import coub
+
+
+def app_dir():
+    """Directory of the running app (exe folder when frozen, else script dir)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.realpath(sys.executable))
+    return os.path.dirname(os.path.realpath(__file__))
 
 
 class GuiDefaultOptions(coub.DefaultOptions):
@@ -41,9 +49,9 @@ class GuiDefaultOptions(coub.DefaultOptions):
     }
 
     def __init__(self):
-        # Necessary as __file__ within coub.py would point to the extracted
-        # PyInstaller archive for standalone coub-gui binaries
-        config_dirs = [os.path.dirname(os.path.realpath(__file__))]
+        # Read config from the app directory (exe folder when frozen). Using
+        # __file__ would point into the temporary PyInstaller extraction dir.
+        config_dirs = [app_dir()]
         super(GuiDefaultOptions, self).__init__(config_dirs=config_dirs)
 
         # There's no way for the user to enter input if a prompt occurs
@@ -77,6 +85,77 @@ def translate_to_cli(options):
     options.share, options.v_only, options.a_only = SPECIAL_LABEL[options.special]
 
     return options
+
+
+# Settings that make sense to persist across runs (written to coub.conf).
+PERSISTED_KEYS = [
+    "PATH", "KEEP", "REPEAT", "DURATION", "PREVIEW", "ARCHIVE",
+    "CONNECTIONS", "RETRIES", "MAX_COUBS",
+    "V_QUALITY", "A_QUALITY", "V_MAX", "V_MIN", "AAC",
+    "SHARE", "V_ONLY", "A_ONLY",
+    "MERGE_EXT", "NAME_TEMPLATE", "MY_CHANNEL",
+]
+
+
+def format_value(key, value):
+    """Serialize a setting value back into the coub.conf format."""
+    # None is the internal representation of the default "%id%" name template
+    if key == "NAME_TEMPLATE" and value is None:
+        return "%id%"
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    return str(value)
+
+
+def save_settings(options):
+    """Write the current GUI settings to coub.conf next to the app."""
+    config_path = os.path.join(app_dir(), "coub.conf")
+
+    values = {}
+    for key in PERSISTED_KEYS:
+        value = getattr(options, key.lower(), None)
+        values[key] = format_value(key, value)
+
+    # The token is only persisted when explicitly requested (plain-text secret)
+    if getattr(options, "save_token", False):
+        token = getattr(options, "auth_token", None)
+        values["AUTH_TOKEN"] = format_value("AUTH_TOKEN", token)
+
+    # Merge with the existing config so hand-written entries aren't lost
+    lines = []
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except (OSError, UnicodeError):
+            lines = []
+
+    written = set()
+    merged = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            merged.append(line)
+            continue
+        name = stripped.split("=", 1)[0].strip()
+        if name in values:
+            merged.append(f"{name} = {values[name]}")
+            written.add(name)
+        else:
+            merged.append(line)
+
+    for key in values:
+        if key not in written:
+            merged.append(f"{key} = {values[key]}")
+
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(merged) + "\n")
+    except OSError:
+        coub.err(f"Warning: failed to save settings to '{config_path}'",
+                 color=coub.fgcolors.WARNING)
 
 
 @Gooey(
@@ -161,6 +240,38 @@ def parse_cli():
                         help="Download N*1000 randomly generated coubs")
     input_.add_argument("--hot", action="store_true", widget="BlockCheckbox",
                         metavar="Hot Section", help="Download coubs from the hot section")
+
+    # Account
+    account = parser.add_argument_group(
+        "Account",
+        description="Paste the full value of the 'sb-gotrue-auth-token' cookie "
+                    "(starts with 'base64-') to unlock liked/bookmarked coubs, "
+                    "private coubs and your own channel.",
+        gooey_options={'columns': 1}
+    )
+    account.add_argument("--token", dest="auth_token", default=defs.AUTH_TOKEN,
+                         metavar="Auth Token",
+                         help="Full value of the sb-gotrue-auth-token cookie "
+                              "(starts with 'base64-'). Required for liked, "
+                              "bookmarks, private coubs and your own channel.")
+    account.add_argument("--save-token", dest="save_token", action="store_true",
+                         widget="BlockCheckbox", metavar="Save token",
+                         help="Persist the token in coub.conf (plain text). "
+                              "If unchecked, the token is only used for this run.")
+    account.add_argument("--liked", action="store_true", widget="BlockCheckbox",
+                         metavar="Liked coubs",
+                         help="Download your liked coubs (requires Auth Token)")
+    account.add_argument("--bookmarks", action="store_true",
+                         widget="BlockCheckbox", metavar="Bookmarks",
+                         help="Download your bookmarked coubs (requires Auth Token)")
+    account.add_argument("--my-channel", dest="my_channel", default=defs.MY_CHANNEL,
+                         metavar="My Channel",
+                         help="Permalink of your own channel "
+                              "(e.g. the part after coub.com/)")
+    account.add_argument("--download-my-channel", dest="download_my_channel",
+                         action="store_true", widget="BlockCheckbox",
+                         metavar="Download my channel",
+                         help="Download all coubs from 'My Channel'")
 
     # Common Options
     common = parser.add_argument_group("General", gooey_options={'columns': 1})
@@ -262,6 +373,15 @@ def parse_cli():
     )
 
     args = parser.parse_args()
+
+    if (args.liked or args.bookmarks) and not args.auth_token:
+        coub.err("Error: 'Liked coubs' and 'Bookmarks' require an Auth Token.")
+        sys.exit(coub.status.OPT)
+
+    if args.download_my_channel and not args.my_channel:
+        coub.err("Error: 'Download my channel' requires a value in 'My Channel'.")
+        sys.exit(coub.status.OPT)
+
     args.input = []
     args.input.extend([coub.mapped_input(u) for u in args.urls.split(",") if u])
     args.input.extend([i for i in args.ids.split(",") if i])
@@ -275,6 +395,12 @@ def parse_cli():
     if args.random:
         for _ in range(args.random):
             args.input.append(coub.RandomCategory())
+    if args.liked:
+        args.input.append(coub.UserScoped("likes"))
+    if args.bookmarks:
+        args.input.append(coub.UserScoped("bookmarks"))
+    if args.download_my_channel:
+        args.input.append(coub.Channel(args.my_channel))
 
     # Read archive content
     if args.archive and os.path.exists(args.archive):
@@ -300,4 +426,5 @@ def parse_cli():
 
 if __name__ == '__main__':
     coub.opts = parse_cli()
+    save_settings(coub.opts)
     coub.main()

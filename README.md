@@ -2,6 +2,15 @@
 
 CoubDownloader is a simple script to download videos (called coubs) from [Coub](https://coub.com).
 
+> **This is a fork** of [HelpSeeker/CoubDownloader](https://github.com/HelpSeeker/CoubDownloader), updated to keep working with Coub's current website.
+
+## Changes in this fork
+
+* **New Coub API** — ported from the legacy `/api/v2` endpoints to the current `coub-site` API (`/api/coub-site/timeline`). Channels, tags, searches, communities, hot and random sections work again.
+* **Account support** — paste the value of the `sb-gotrue-auth-token` cookie (starts with `base64-`) into the GUI's *Account* tab to download your **liked** and **bookmarked** coubs, your **own channel** and **private coubs**.
+* **GUI settings persistence** — the GUI saves your settings (output path, container, name template, quality/format options, etc.) to `coub.conf` next to the executable, so they survive restarts and even crashes.
+* **Self-contained Windows exe** — standalone builds bundle FFmpeg, so no separate FFmpeg install is required.
+
 **Linux users might be interested in CoubDownloader's successor [Gyre](https://github.com/HelpSeeker/Gyre).**
 
 **Update 2021-01-02: Gyre can now also be used on Windows, but requires an MSYS2 setup (see [Gyre on Windows](https://github.com/HelpSeeker/Gyre#gyre-on-windows)).**
@@ -117,7 +126,7 @@ Output:
 
 ## Standalone builds
 
-Starting with v3.7 standalone Windows builds are provided on the [release page](https://github.com/HelpSeeker/CoubDownloader/releases). These executables don't require an existing Python environment and the [GUI version](#gui) is a standalone application. FFmpeg is still a mandatory requirement.
+Starting with v3.7 standalone Windows builds are provided on the [release page](https://github.com/HelpSeeker/CoubDownloader/releases). These executables don't require an existing Python environment and the [GUI version](#gui) is a standalone application. In this fork the Windows executable also bundles FFmpeg, so no separate FFmpeg install is required.
 
 #### Why no Mac builds?
 
@@ -156,6 +165,8 @@ Lines starting with `#` get treated as comments.
 
 For all available options and their allowed values, please take a look at the [example configuration file](example.conf).
 
+The GUI writes this file automatically (next to the executable) after each run, so the values you entered are remembered. Account-related options are `AUTH_TOKEN` (the full `sb-gotrue-auth-token` cookie value) and `MY_CHANNEL` (permalink of your own channel).
+
 ## Input
 
 #### Overview
@@ -183,6 +194,8 @@ Contents
   -) Communities (incl. Featured & Coub of the Day)
   -) Hot section
   -) Random
+  -) Liked coubs (CLI: --liked, requires --token)
+  -) Bookmarks (CLI: --bookmarks, requires --token)
 
 2. Input Methods
 ================
@@ -415,6 +428,15 @@ It provides the same functionality as the main CLI tool, with a few notable exce
 * No overwrite prompt (default prompt answer is set to "no")
 * No option equivalent to `--random#top` (direct URL input must be used)
 * The output path defaults to "coubs" in the user's home directory instead of the current one
+
+The GUI adds an **Account** tab with these fields:
+
+* **Auth Token** — paste the full value of the `sb-gotrue-auth-token` cookie (starts with `base64-`).
+* **Save token** — optionally persist the token in `coub.conf` (stored in plain text, off by default).
+* **Liked coubs** / **Bookmarks** — download your liked/bookmarked coubs (require an auth token).
+* **My Channel** / **Download my channel** — download all coubs from your own channel.
+
+The GUI also saves your settings to `coub.conf` next to the executable after each run.
 
 Another important difference is that `coub-gui.py` is **NOT** a standalone script. It depends on `coub.py` being in the same location.
 
