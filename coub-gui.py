@@ -202,10 +202,10 @@ def parse_cli():
     formats.add_argument("--a-quality", choices=["Best quality", "Worst quality"],
                          default=defs.QUALITY_LABEL[defs.A_QUALITY],
                          metavar="Audio Quality", help="Which audio quality to download")
-    formats.add_argument("--v-max", choices=["med", "high", "higher"],
+    formats.add_argument("--v-max", choices=["low", "sd", "hd"],
                          default=defs.V_MAX, metavar="Max. Video Quality",
                          help="Cap the max. video quality considered for download")
-    formats.add_argument("--v-min", choices=["med", "high", "higher"],
+    formats.add_argument("--v-min", choices=["low", "sd", "hd"],
                          default=defs.V_MIN, metavar="Min. Video Quality",
                          help="Cap the min. video quality considered for download")
     formats.add_argument("--aac", default=defs.AAC_LABEL[defs.AAC],

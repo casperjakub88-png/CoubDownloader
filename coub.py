@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -29,6 +30,7 @@ from ssl import SSLCertVerificationError
 from textwrap import dedent
 
 import urllib.error
+import urllib.request
 from urllib.request import urlopen
 from urllib.parse import quote as urlquote
 from urllib.parse import unquote as urlunquote
@@ -100,6 +102,94 @@ count = 0
 done = 0
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# New Coub API (coub-site) constants & helpers
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+TIMELINE_URL = "https://coub.com/api/coub-site/timeline"
+COUB_VIEW_URL = "https://coub.com/view/"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/98.0.4758.80 Safari/537.36"
+)
+
+# Next.js embeds data as escaped JSON strings inside chunks like:
+#   self.__next_f.push([1,"...escaped json..."])
+_NEXT_F_CHUNK = re.compile(r'self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)')
+
+
+def request_headers(token=None):
+    """Return HTTP headers for Coub requests (browser UA + optional auth cookie)."""
+    headers = {"User-Agent": USER_AGENT}
+    if token:
+        headers["Cookie"] = f"sb-gotrue-auth-token={token}"
+    return headers
+
+
+def fetch_text(url, token=None):
+    """Synchronous fetch returning decoded text (urllib)."""
+    req = urllib.request.Request(url, headers=request_headers(token))
+    with urlopen(req) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def fetch_json(url, token=None):
+    """Synchronous fetch returning parsed JSON (urllib)."""
+    req = urllib.request.Request(url, headers=request_headers(token))
+    with urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+async def fetch_json_async(session, url, token=None):
+    """Asynchronous fetch returning parsed JSON (aiohttp)."""
+    async with session.get(url, headers=request_headers(token)) as resp:
+        return json.loads(await resp.read())
+
+
+def scrape_channel_id(name):
+    """Resolve a channel username to its UUID by scraping the channel page."""
+    html = fetch_text(f"https://coub.com/{urlquote(name)}")
+    # Channel data is embedded in the page as escaped JSON
+    html = html.replace('\\"', '"')
+    match = re.search(
+        rf'"channelId":"([0-9a-f-]{{36}})","permalink":"{re.escape(name)}"',
+        html, re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
+def scrape_coub_page(permalink):
+    """Read a single coub's data from its page (there is no public single-coub API)."""
+    html = fetch_text(f"{COUB_VIEW_URL}{permalink}")
+
+    # Join all Next.js chunks; each chunk is an escaped JSON string
+    stream = []
+    for chunk in _NEXT_F_CHUNK.finditer(html):
+        try:
+            stream.append(json.loads(chunk.group(1)))
+        except json.JSONDecodeError:
+            continue
+    data = "".join(stream)
+
+    marker = f'"permalink":{json.dumps(permalink)}'
+    index = data.find(marker)
+    while index >= 0:
+        start = data.rfind('{"id":"', 0, index)
+        if start >= 0:
+            try:
+                coub, _ = json.JSONDecoder().raw_decode(data[start:])
+            except json.JSONDecodeError:
+                coub = None
+            if coub is not None and (
+                isinstance(coub.get("videoHdUrl"), str)
+                or isinstance(coub.get("videoSdUrl"), str)
+            ):
+                return coub
+        index = data.find(marker, index + 1)
+
+    return None
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Classes
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -120,9 +210,9 @@ class DefaultOptions:
     # Format defaults
     V_QUALITY = -1
     A_QUALITY = -1
-    V_MAX = "higher"
-    V_MIN = "med"
-    AAC = 1
+    V_MAX = "hd"
+    V_MIN = "low"
+    AAC = 1  # deprecated: the new API only provides MP3 audio
     SHARE = False
     # Channel defaults
     RECOUBS = 1
@@ -133,6 +223,8 @@ class DefaultOptions:
     V_ONLY = False
     OUTPUT_LIST = None
     ARCHIVE = None
+    # Auth token (value of the sb-gotrue-auth-token cookie) for liked/bookmarks
+    AUTH_TOKEN = None
     # Output defaults
     MERGE_EXT = "mkv"
     NAME_TEMPLATE = "%id%"
@@ -188,10 +280,11 @@ class DefaultOptions:
             "MAX_COUBS": (lambda x: isinstance(x, int) and x > 0 or x is None),
             "V_QUALITY": (lambda x: x in [0, -1]),
             "A_QUALITY": (lambda x: x in [0, -1]),
-            "V_MAX": (lambda x: x in ["higher", "high", "med"]),
-            "V_MIN": (lambda x: x in ["higher", "high", "med"]),
+            "V_MAX": (lambda x: x in ["hd", "sd", "low"]),
+            "V_MIN": (lambda x: x in ["hd", "sd", "low"]),
             "AAC": (lambda x: x in [0, 1, 2, 3]),
             "SHARE": (lambda x: isinstance(x, bool)),
+            "AUTH_TOKEN": (lambda x: isinstance(x, str) or x is None),
             "RECOUBS": (lambda x: x in [0, 1, 2]),
             "PREVIEW": (lambda x: isinstance(x, str) or x is None),
             "A_ONLY": (lambda x: isinstance(x, bool)),
@@ -234,6 +327,7 @@ class DefaultOptions:
             "PREVIEW",
             "OUTPUT_LIST",
             "ARCHIVE",
+            "AUTH_TOKEN",
             "NAME_TEMPLATE",
             "FFMPEG_PATH",
             "TAG_SEP",
@@ -288,6 +382,8 @@ class CustomArgumentParser(argparse.ArgumentParser):
                                   NAME as seen in the URL (e.g. animals-pets)
           --hot                 download coubs from the hot section (default sorting)
           --random              download random coubs
+          --liked               download your liked coubs (requires --token)
+          --bookmarks           download your bookmarked coubs (requires --token)
           --input-help          show full input help
 
             Input options do NOT support full URLs.
@@ -314,13 +410,11 @@ class CustomArgumentParser(argparse.ArgumentParser):
           --bestvideo           download best available video quality (def)
           --worstvideo          download worst available video quality
           --max-video FORMAT    set limit for the best video format (def: {self.get_default("v_max")})
-                                  Supported values: med, high, higher
+                                  Supported values: low, sd, hd
           --min-video FORMAT    set limit for the worst video format (def: {self.get_default("v_min")})
-                                  Supported values: med, high, higher
+                                  Supported values: low, sd, hd
           --bestaudio           download best available audio quality (def)
           --worstaudio          download worst available audio quality
-          --aac                 prefer AAC over higher quality MP3 audio
-          --aac-strict          only download AAC audio (never MP3)
           --share               download 'share' video (shorter and includes audio)
 
         Channel options:
@@ -504,12 +598,15 @@ class CustomArgumentParser(argparse.ArgumentParser):
 
 class BaseContainer:
     """Base class for link containers (timelines)."""
+
     type = None
+    kind = None
+    # Legacy sort orders mapped to the new "order" query parameter.
+    # Any sort not listed here falls back to the default ordering.
+    SORT_TO_ORDER = {}
 
     def __init__(self, id_):
         self.valid = True
-        self.pages = 0
-        self.template = ""
 
         id_ = no_url(id_)
         try:
@@ -519,268 +616,180 @@ class BaseContainer:
             self.sort = None
 
         # Links copied from the browser already have special characters escaped
-        # Using urlquote on them again in the template functions would lead
-        # to invalid templates
-        # Also prettifies messages that show the ID as info
         self.id = urlunquote(self.id)
 
-    def get_template(self):
-        """Placeholder function, which must be overwritten by subclasses."""
-        self.template = ""
+    def get_query(self):
+        """Build the timeline query string (everything after '?', without cursor)."""
+        raise NotImplementedError
 
-    def get_page_count(self):
-        """Contact API once to get page count and check validity."""
-        if not self.valid:
-            return
+    def order_param(self):
+        """Translate the legacy sort order to the new 'order' value (or None)."""
+        return self.SORT_TO_ORDER.get(self.sort)
 
-        try:
-            with urlopen(self.template) as resp:
-                resp_json = json.loads(resp.read())
-        except urllib.error.HTTPError:
-            err(f"\nInvalid {self.type} ('{self.id}')!",
-                color=fgcolors.WARNING)
-            self.valid = False
-            return
-
-        self.pages = resp_json['total_pages']
+    def keep_item(self, item):
+        """Filter hook for individual timeline items (e.g. reposts)."""
+        return True
 
     async def process(self, quantity=None):
-        """
-        Parse the coub links from tags, channels, etc.
-
-        The Coub API refers to the list of coubs from a tag, channel,
-        community, etc. as a timeline.
-        """
-        self.get_template()
-        self.get_page_count()
+        """Parse coub links from the timeline using cursor-based pagination."""
+        query = self.get_query()
         if not self.valid:
             return []
 
-        pages = self.pages
-
-        # Limit max. number of requested pages
-        # Necessary as self.parse_page() returns when limit
-        # is reached, but only AFTER the request was made
-        if quantity:
-            max_pages = ceil(quantity / opts.coubs_per_page)
-            if pages > max_pages:
-                pages = max_pages
-
-        requests = [f"{self.template}&page={p}" for p in range(1, pages+1)]
-
         msg(f"\nDownloading {self.type} info"
             f"{f': {self.id}' if self.id else ''}"
-            f" (sorted by '{self.sort}')")
+            f"{f' (sorted by {self.sort})' if self.sort else ''}")
+
+        token = getattr(opts, "auth_token", None)
+        ids = []
+        cursor = ""
 
         if aio:
-            msg(f"  {pages} out of {self.pages} pages")
-
             tout = aiohttp.ClientTimeout(total=None)
             conn = aiohttp.TCPConnector(limit=opts.connections)
             async with aiohttp.ClientSession(timeout=tout, connector=conn) as session:
-                tasks = [parse_page(req, session) for req in requests]
-                ids = await asyncio.gather(*tasks)
-            ids = [i for page in ids for i in page]
+                while True:
+                    url = f"{TIMELINE_URL}?{query}&cursor={urlquote(cursor)}"
+                    data = await fetch_json_async(session, url, token)
+                    for item in data.get("items") or []:
+                        if self.keep_item(item):
+                            ids.append(item["permalink"])
+                    nxt = data.get("next")
+                    if not nxt or nxt == cursor:
+                        break
+                    cursor = nxt
+                    if quantity and len(ids) >= quantity:
+                        break
         else:
-            ids = []
-            for i in range(pages):
-                msg(f"  {i+1} out of {self.pages} pages")
-                page = await parse_page(requests[i])
-                ids.extend(page)
+            while True:
+                url = f"{TIMELINE_URL}?{query}&cursor={urlquote(cursor)}"
+                data = fetch_json(url, token)
+                for item in data.get("items") or []:
+                    if self.keep_item(item):
+                        ids.append(item["permalink"])
+                nxt = data.get("next")
+                if not nxt or nxt == cursor:
+                    break
+                cursor = nxt
+                if quantity and len(ids) >= quantity:
+                    break
 
-        if quantity:
-            return ids[:quantity]
-        return ids
+        return ids[:quantity] if quantity else ids
 
 
 class Channel(BaseContainer):
     """Store and parse channels."""
     type = "channel"
+    kind = "channel"
+    SORT_TO_ORDER = {
+        "most_liked": "likes_count",
+        "most_viewed": "views_count",
+        "oldest": "oldest",
+    }
 
     def __init__(self, id_):
         super(Channel, self).__init__(id_)
-        # Available:      most_recent, most_liked, most_viewed, oldest, random
-        # Coub's default: most_recent
+        # Available:      most_recent, most_liked, most_viewed, oldest
+        # Coub's default: most_recent (no order param)
         if not self.sort:
             self.sort = "most_recent"
+        self.channel_id = None
 
-    def get_template(self):
-        """Return API request template for channels."""
-        methods = {
-            'most_recent': "newest",
-            'most_liked': "likes_count",
-            'most_viewed': "views_count",
-            'oldest': "oldest",
-            'random': "random",
-        }
-
-        template = f"https://coub.com/api/v2/timeline/channel/{urlquote(self.id)}"
-        template = f"{template}?per_page={opts.coubs_per_page}"
-
-        if opts.recoubs == 0:
-            template = f"{template}&type=simples"
-        elif opts.recoubs == 2:
-            template = f"{template}&type=recoubs"
-
-        if self.sort in methods:
-            template = f"{template}&order_by={methods[self.sort]}"
-        else:
-            err(f"\nInvalid channel sort order '{self.sort}' ({self.id})!",
+    def get_query(self):
+        """Build the timeline query and resolve the channel name to its UUID."""
+        self.channel_id = scrape_channel_id(self.id)
+        if not self.channel_id:
+            err(f"\nChannel '{self.id}' does not exist!",
                 color=fgcolors.WARNING)
             self.valid = False
+            return ""
+        query = f"kind={self.kind}&channel_id={self.channel_id}"
+        order = self.order_param()
+        return f"{query}&order={order}" if order else query
 
-        self.template = template
+    def keep_item(self, item):
+        """Filter reposts according to the --recoubs option."""
+        if opts.recoubs == 1:
+            return True
+        author = (item.get("channel") or {}).get("permalink")
+        is_repost = bool(author) and author.lower() != self.id.lower()
+        if opts.recoubs == 0:
+            return not is_repost
+        if opts.recoubs == 2:
+            return is_repost
+        return True
 
 
 class Tag(BaseContainer):
     """Store and parse tags."""
     type = "tag"
+    kind = "tag"
+    SORT_TO_ORDER = {
+        "top": "likes_count",
+        "views_count": "views_count",
+    }
 
     def __init__(self, id_):
         super(Tag, self).__init__(id_)
-        # Available:      popular, top, views_count, fresh
-        # Coub's default: popular
+        # Available:      popular, top, views_count
+        # Coub's default: popular (no order param)
         if not self.sort:
             self.sort = "popular"
 
-    def get_template(self):
-        """Return API request template for tags."""
-        methods = {
-            'popular': "newest_popular",
-            'top': "likes_count",
-            'views_count': "views_count",
-            'fresh': "newest"
-        }
-
-        template = f"https://coub.com/api/v2/timeline/tag/{urlquote(self.id)}"
-        template = f"{template}?per_page={opts.coubs_per_page}"
-
-        if self.sort in methods:
-            template = f"{template}&order_by={methods[self.sort]}"
-        else:
-            err(f"\nInvalid tag sort order '{self.sort}' ({self.id})!",
-                color=fgcolors.WARNING)
-            self.valid = False
-
-        self.template = template
-
-    def get_page_count(self):
-        super(Tag, self).get_page_count()
-        # API limits tags to 99 pages
-        if self.pages > 99:
-            self.pages = 99
+    def get_query(self):
+        query = f"kind={self.kind}&tag={urlquote(self.id)}"
+        order = self.order_param()
+        return f"{query}&order={order}" if order else query
 
 
 class Search(BaseContainer):
     """Store and parse searches."""
     type = "search"
+    kind = "search"
+    SORT_TO_ORDER = {
+        "top": "likes_count",
+        "views_count": "views_count",
+    }
 
     def __init__(self, id_):
         super(Search, self).__init__(id_)
-        # Available:      relevance, top, views_count, most_recent
-        # Coub's default: relevance
+        # Available:      relevance, top, views_count
+        # Coub's default: relevance (no order param)
         if not self.sort:
             self.sort = "relevance"
 
-    def get_template(self):
-        """Return API request template for coub searches."""
-        methods = {
-            'relevance': None,
-            'top': "likes_count",
-            'views_count': "views_count",
-            'most_recent': "newest"
-        }
-
-        template = f"https://coub.com/api/v2/search/coubs?q={urlquote(self.id)}"
-        template = f"{template}&per_page={opts.coubs_per_page}"
-
-        if self.sort not in methods:
-            err(f"\nInvalid search sort order '{self.sort}' ({self.id})!",
-                color=fgcolors.WARNING)
-            self.valid = False
-        # The default tab on coub.com is labelled "Relevance", but the
-        # default sort order is actually no sort order
-        elif self.sort != "relevance":
-            template = f"{template}&order_by={methods[self.sort]}"
-
-        self.template = template
+    def get_query(self):
+        query = f"kind={self.kind}&q={urlquote(self.id)}"
+        order = self.order_param()
+        return f"{query}&order={order}" if order else query
 
 
 class Community(BaseContainer):
     """Store and parse communities."""
     type = "community"
+    kind = "community"
+    SORT_TO_ORDER = {
+        "top": "likes_count",
+        "views_count": "views_count",
+    }
 
     def __init__(self, id_):
         super(Community, self).__init__(id_)
-        # Available:      hot_daily, hot_weekly, hot_monthly, hot_quarterly,
-        #                 hot_six_months, rising, fresh, top, views_count, random
-        # Coub's default: hot_monthly
+        # Available:      hot_monthly (default), top, views_count
+        # Note: 'featured'/'coub-of-the-day' are not exposed by the new API.
         if not self.sort:
-            if self.id in ("featured", "coub-of-the-day"):
-                self.sort = "recent"
-            else:
-                self.sort = "hot_monthly"
+            self.sort = "hot_monthly"
 
-    def get_template(self):
-        """Return API request template for communities."""
-        if self.id == "featured":
-            methods = {
-                'recent': None,
-                'top_of_the_month': "top_of_the_month",
-                'undervalued': "undervalued",
-            }
-            template = "https://coub.com/api/v2/timeline/explore?"
-        elif self.id == "coub-of-the-day":
-            methods = {
-                'recent': None,
-                'top': "top",
-                'views_count': "views_count",
-            }
-            template = "https://coub.com/api/v2/timeline/explore/coub_of_the_day?"
-        else:
-            methods = {
-                'hot_daily': "daily",
-                'hot_weekly': "weekly",
-                'hot_monthly': "monthly",
-                'hot_quarterly': "quarter",
-                'hot_six_months': "half",
-                'rising': "rising",
-                'fresh': "fresh",
-                'top': "likes_count",
-                'views_count': "views_count",
-                'random': "random",
-            }
-            template = f"https://coub.com/api/v2/timeline/community/{urlquote(self.id)}"
-
-        if self.sort not in methods:
-            err(f"\nInvalid community sort order '{self.sort}' ({self.id})!",
-                color=fgcolors.WARNING)
-            self.valid = False
-            return
-
-        if self.id in ("featured", "coub-of-the-day"):
-            if self.sort != "recent":
-                template = f"{template}order_by={methods[self.sort]}&"
-        else:
-            if self.sort in ("top", "views_count"):
-                template = f"{template}/fresh?order_by={methods[self.sort]}&"
-            elif self.sort == "random":
-                template = f"https://coub.com/api/v2/timeline/random/{self.id}?"
-            else:
-                template = f"{template}/{methods[self.sort]}?"
-
-        self.template = f"{template}per_page={opts.coubs_per_page}"
-
-    def get_page_count(self):
-        super(Community, self).get_page_count()
-        # API limits communities to 99 pages
-        if self.pages > 99:
-            self.pages = 99
+    def get_query(self):
+        query = f"kind={self.kind}&community={urlquote(self.id)}"
+        order = self.order_param()
+        return f"{query}&order={order}" if order else query
 
 
 class HotSection(BaseContainer):
     """Store and parse the hot section."""
     type = "hot section"
+    kind = "hot"
 
     def __init__(self, sort=None):
         super(HotSection, self).__init__("hot")
@@ -788,72 +797,44 @@ class HotSection(BaseContainer):
         self.sort = sort
         # Available:      hot_daily, hot_weekly, hot_monthly, hot_quarterly,
         #                 hot_six_months, rising, fresh
-        # Coub's default: hot_monthly
+        # Coub's default: hot_monthly (no order param)
         if not self.sort:
             self.sort = "hot_monthly"
 
-    def get_template(self):
-        """Return API request template for Coub's hot section."""
-        methods = {
-            'hot_daily': "daily",
-            'hot_weekly': "weekly",
-            'hot_monthly': "monthly",
-            'hot_quarterly': "quarter",
-            'hot_six_months': "half",
-            'rising': "rising",
-            'fresh': "fresh",
-        }
-
-        template = "https://coub.com/api/v2/timeline/subscriptions"
-
-        if self.sort in methods:
-            template = f"{template}/{methods[self.sort]}"
-        else:
-            err(f"\nInvalid hot section sort order '{self.sort}'!",
-                color=fgcolors.WARNING)
-            self.valid = False
-
-        template = f"{template}?per_page={opts.coubs_per_page}"
-
-        self.template = template
-
-    def get_page_count(self):
-        super(HotSection, self).get_page_count()
-        # API limits hot section to 99 pages
-        if self.pages > 99:
-            self.pages = 99
+    def get_query(self):
+        return f"kind={self.kind}"
 
 
 class RandomCategory(BaseContainer):
     """Store and parse the random category."""
     type = "random"
+    kind = "random"
 
     def __init__(self, sort=None):
         super(RandomCategory, self).__init__("random")
         self.id = None
         self.sort = sort
         # Available:      popular, top
-        # Coub's default: popular
+        # Coub's default: popular (no order param)
         if not self.sort:
             self.sort = "popular"
 
-    def get_template(self):
-        """Return API request template for Coub's random category."""
-        methods = {
-            'popular': None,
-            'top': "top",
-        }
-        template = "https://coub.com/api/v2/timeline/explore/random?"
+    def get_query(self):
+        return f"kind={self.kind}"
 
-        if self.sort not in methods:
-            err(f"\nInvalid random sort order '{self.sort}'!",
-                color=fgcolors.WARNING)
-            self.valid = False
-            return
-        if self.sort == "top":
-            template = f"{template}order_by={methods[self.sort]}&"
 
-        self.template = f"{template}per_page={opts.coubs_per_page}"
+class UserScoped(BaseContainer):
+    """Store and parse user-scoped timelines (liked/bookmarked coubs)."""
+    type = "user scope"
+
+    def __init__(self, scope):
+        self.valid = True
+        self.id = scope
+        self.sort = None
+        self.scope = scope
+
+    def get_query(self):
+        return f"kind=hot&scope={self.scope}"
 
 
 class LinkList:
@@ -894,7 +875,6 @@ class Coub:
     def __init__(self, c_id):
         self.id = c_id
         self.link = f"https://coub.com/view/{self.id}"
-        self.req = f"https://coub.com/api/v2/coubs/{self.id}"
 
         self.v_link = None
         self.a_link = None
@@ -931,42 +911,35 @@ class Coub:
             self.exists = True
 
     async def parse(self, session=None):
-        """Get all necessary coub infos from the Coub API."""
+        """Get all necessary coub infos by scraping the coub's page."""
         if self.erroneous():
             return
 
-        if aio:
-            async with session.get(self.req) as resp:
-                resp_json = await resp.read()
-                resp_json = json.loads(resp_json)
-        else:
-            try:
-                with urlopen(self.req) as resp:
-                    resp_json = resp.read()
-                    resp_json = json.loads(resp_json)
-            except (urllib.error.HTTPError, urllib.error.URLError):
-                self.unavailable = True
-                return
-
-        v_list, a_list = stream_lists(resp_json)
-        if v_list:
-            self.v_link = v_list[opts.v_quality]
-        else:
+        try:
+            data = scrape_coub_page(self.id)
+        except (urllib.error.HTTPError, urllib.error.URLError):
             self.unavailable = True
             return
 
-        if a_list:
-            self.a_link = a_list[opts.a_quality]
-        elif opts.a_only:
+        if not data:
             self.unavailable = True
             return
 
-        self.name = get_name(resp_json, self.id)
+        self.v_link, self.a_link = stream_lists(data)
 
-        if not opts.a_only:
+        if not self.v_link and not opts.a_only:
+            self.unavailable = True
+            return
+        if not self.a_link and opts.a_only:
+            self.unavailable = True
+            return
+
+        self.name = get_name(data, self.id)
+
+        if not opts.a_only and self.v_link:
             self.v_name = f"{self.name}.mp4"
         if not opts.v_only and self.a_link:
-            a_ext = self.a_link.split(".")[-1]
+            a_ext = self.a_link.split("?")[0].split(".")[-1]
             self.a_name = f"{self.name}.{a_ext}"
 
     async def download(self, session=None):
@@ -1166,8 +1139,15 @@ def msg(*args, color=fgcolors.RESET, **kwargs):
 
 def check_prereq():
     """Test if all required 3rd-party tools are installed."""
+    ffmpeg_path = opts.ffmpeg_path
+    # Prefer a local ffmpeg.exe next to the script (Windows convenience)
+    local = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ffmpeg.exe")
+    if ffmpeg_path == "ffmpeg" and os.path.exists(local):
+        ffmpeg_path = local
+        opts.ffmpeg_path = local
+
     try:
-        subprocess.run([opts.ffmpeg_path],
+        subprocess.run([ffmpeg_path],
                        stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL,
                        check=False)
@@ -1429,6 +1409,12 @@ def parse_cli():
                         action="append_const", const=RandomCategory())
     parser.add_argument("--random#top", dest="input", action="append_const",
                         const=RandomCategory("top"))
+    parser.add_argument("--liked", dest="input", action="append_const",
+                        const=UserScoped("likes"),
+                        help="download your liked coubs (requires --token)")
+    parser.add_argument("--bookmarks", dest="input", action="append_const",
+                        const=UserScoped("bookmarks"),
+                        help="download your bookmarked coubs (requires --token)")
     parser.add_argument("--input-help", action=InputHelp)
     # Common Options
     parser.add_argument("-q", "--quiet", dest="verbosity", action="store_const",
@@ -1464,9 +1450,12 @@ def parse_cli():
     a_qual.add_argument("--worstaudio", dest="a_quality", action="store_const",
                         const=0, default=defaults.A_QUALITY)
     parser.add_argument("--max-video", dest="v_max", default=defaults.V_MAX,
-                        choices=["med", "high", "higher"])
+                        choices=["low", "sd", "hd"])
     parser.add_argument("--min-video", dest="v_min", default=defaults.V_MIN,
-                        choices=["med", "high", "higher"])
+                        choices=["low", "sd", "hd"])
+    parser.add_argument("--token", dest="auth_token", default=defaults.AUTH_TOKEN,
+                        metavar="TOKEN",
+                        help="Auth token (sb-gotrue-auth-token cookie) for liked/bookmarks")
     aac = parser.add_mutually_exclusive_group()
     aac.add_argument("--aac", action="store_const", const=2, default=defaults.AAC)
     aac.add_argument("--aac-strict", dest="aac", action="store_const", const=3,
@@ -1546,7 +1535,7 @@ def parse_cli():
 
 def check_options():
     """Test the user input (command line) for its validity."""
-    formats = {'med': 0, 'high': 1, 'higher': 2}
+    formats = {'low': 0, 'sd': 1, 'hd': 2}
     if formats[opts.v_min] > formats[opts.v_max]:
         err("Quality of --min-quality greater than --max-quality!")
         sys.exit(status.OPT)
@@ -1557,24 +1546,6 @@ def resolve_paths():
     if not os.path.exists(opts.path):
         os.makedirs(opts.path)
     os.chdir(opts.path)
-
-
-async def parse_page(req, session=None):
-    """Request a single timeline page and parse its content."""
-    if aio:
-        async with session.get(req) as resp:
-            resp_json = await resp.read()
-            resp_json = json.loads(resp_json)
-    else:
-        with urlopen(req) as resp:
-            resp_json = resp.read()
-            resp_json = json.loads(resp_json)
-
-    ids = [
-        c['recoub_to']['permalink'] if c['recoub_to'] else c['permalink']
-        for c in resp_json['coubs']
-    ]
-    return ids
 
 
 def remove_container_dupes(containers):
@@ -1662,16 +1633,13 @@ def get_name(req_json, c_id):
 
     specials = {
         '%id%': c_id,
-        '%title%': req_json['title'],
-        '%creation%': req_json['created_at'],
-        '%channel%': req_json['channel']['title'],
-        '%tags%': opts.tag_sep.join([t['title'] for t in req_json['tags']]),
+        '%title%': req_json.get('title') or '',
+        '%creation%': req_json.get('publishedAt') or '',
+        '%channel%': (req_json.get('channel') or {}).get('title') or '',
+        '%tags%': opts.tag_sep.join(req_json.get('tags') or []),
     }
     # Coubs don't necessarily belong to a community (although it's rare)
-    try:
-        specials['%community%'] = req_json['communities'][0]['permalink']
-    except (KeyError, TypeError, IndexError):
-        specials['%community%'] = "undefined"
+    specials['%community%'] = (req_json.get('community') or {}).get('permalink') or "undefined"
 
     name = opts.name_template
     for to_replace in specials:
@@ -1705,14 +1673,7 @@ def exists(name):
     if opts.v_only or opts.share:
         full_name = [f"{name}.mp4"]
     elif opts.a_only:
-        # exists() gets called before and after the API request was made
-        # Unless MP3 or AAC audio are strictly prohibited, there's no way to
-        # tell the final extension before the API request
-        full_name = []
-        if opts.aac > 0:
-            full_name.append(f"{name}.m4a")
-        if opts.aac < 3:
-            full_name.append(f"{name}.mp3")
+        full_name = [f"{name}.mp3"]
     else:
         full_name = [f"{name}.{opts.merge_ext}"]
 
@@ -1744,119 +1705,41 @@ def overwrite(name):
 
 
 def stream_lists(resp_json):
-    """Return all the available video/audio streams of the given coub."""
-    # A few words (or maybe more) regarding Coub's streams:
-    #
-    # 'html5' has 3 video and 2 audio qualities
-    #     video: med    ( ~640px width)
-    #            high   (~1280px width)
-    #            higher (~1600px width)
-    #     audio: med    (MP3@128Kbps CBR)
-    #            high   (MP3@160Kbps VBR)
-    #
-    # 'mobile' has 1 video and 2 audio qualities
-    #     video: video  (~640px width)
-    #     audio: 0      (AAC@128Kbps CBR or rarely MP3@128Kbps CBR)
-    #            1      (MP3@128Kbps CBR)
-    #
-    # 'share' has 1 quality (audio+video)
-    #     video+audio: default (video: ~1280px width, sometimes ~640px width
-    #                           audio: AAC@128Kbps CBR)
-    #
-    # -) all videos come with a watermark
-    # -) html5 video/audio and mobile audio may come in less available
-    #    qualities (although it's quite rare)
-    # -) html5 video med and mobile video are the same file
-    # -) html5 audio med and the worst mobile audio are the same file
-    # -) mobile audio 0 is always the best mobile audio
-    # -) often mobile audio 0 is AAC, but occasionally it's MP3, in which case
-    #    there's no mobile audio 1
-    # -) share audio is always AAC, even if mobile audio is only available as
-    #    MP3
-    # -) share audio is pretty much always shorter than other audio versions
-    # -) videos come as MP4, MP3 audio as MP3 and AAC audio as M4A
-    #
-    # I'd also like to stress that Coub may down- but also upscale (!) the
-    # original footage to provide their standard resolutions. Therefore there's
-    # no such thing as a "best" video stream. Ideally the resolution closest to
-    # the original one should be downloaded.
-    #
-    # All the aforementioned information regards the new Coub storage system
-    # (after the watermark introduction).
-    # Coub is almost done with encoding, but not every stream existence is yet
-    # guaranteed.
-    #
-    # Streams that may still be unavailable:
-    #   -) share
-    #   -) mobile audio in AAC (very very rare)
-    #   -) html5 video higher
-    #   -) html5 video med in a non-broken state (don't require \x00\x00 fix)
-    #
-    # There are no universal rules in which order new streams get added.
-    #
-    # It's a mess. Also release an up-to-date API documentations, you dolts!
+    """Return (video_url, audio_url) chosen from a coub's flat media fields."""
 
-    video = []
-    audio = []
+    video = None
+    audio = None
 
     # In case Coub returns "error: Coub not found"
     if 'error' in resp_json:
-        return ([], [])
+        return (None, None)
 
-    # Special treatment for shared video
+    # 'share' video already includes audio
     if opts.share:
-        version = resp_json['file_versions']['share']['default']
-        # Non-existence results in None or '{}' (the latter is rare)
-        if version and version not in ("{}",):
-            return ([version], [])
+        share = resp_json.get("shareVideoUrl")
+        return (share if isinstance(share, str) else None, None)
 
-        return ([], [])
-
-    # Video stream parsing
-    v_formats = {
-        'med': 0,
-        'high': 1,
-        'higher': 2,
-    }
-
-    v_max = v_formats[opts.v_max]
-    v_min = v_formats[opts.v_min]
-
-    version = resp_json['file_versions']['html5']['video']
-    for vq in v_formats:
-        if v_min <= v_formats[vq] <= v_max:
-            # html5 stream sizes can be 0 OR None in case of a missing stream
-            # None is the exception and an irregularity in the Coub API
-            if vq in version and version[vq]['size']:
-                video.append(version[vq]['url'])
-
-    # Audio stream parsing
-    if opts.aac >= 2:
-        a_combo = [
-            ("html5", "med"),
-            ("html5", "high"),
-            ("mobile", 0),
+    if not opts.a_only:
+        v_order = {"low": 0, "sd": 1, "hd": 2}
+        lo = v_order.get(opts.v_min, 0)
+        hi = v_order.get(opts.v_max, 2)
+        tiers = [
+            (0, resp_json.get("videoLowUrl")),
+            (1, resp_json.get("videoSdUrl")),
+            (2, resp_json.get("videoHdUrl")),
         ]
-    else:
-        a_combo = [
-            ("html5", "med"),
-            ("mobile", 0),
-            ("html5", "high"),
+        candidates = [
+            url for rank, url in tiers
+            if lo <= rank <= hi and isinstance(url, str) and url
         ]
+        if candidates:
+            # opts.v_quality: -1 -> best available, 0 -> worst available
+            video = candidates[-1] if opts.v_quality == -1 else candidates[0]
 
-    for form, aq in a_combo:
-        if 'audio' in resp_json['file_versions'][form]:
-            version = resp_json['file_versions'][form]['audio']
-        else:
-            continue
-
-        if form == "mobile":
-            if opts.aac:
-                # Mobile audio doesn't list its size
-                # So just pray that the file behind the link exists
-                audio.append(version[aq])
-        elif aq in version and version[aq]['size'] and opts.aac < 3:
-            audio.append(version[aq]['url'])
+    if not opts.v_only:
+        audio = resp_json.get("audioUrl")
+        if not isinstance(audio, str):
+            audio = None
 
     return (video, audio)
 
