@@ -135,6 +135,30 @@ USER_AGENT = (
     "Chrome/98.0.4758.80 Safari/537.36"
 )
 
+# Hot section periods as exposed by https://coub.com/hot?period=<value>.
+# Legacy sort names (hot_daily, ...) are accepted as aliases and mapped to
+# the value the timeline API expects.
+HOT_PERIOD_ALIASES = {
+    "daily": "daily",
+    "hot_daily": "daily",
+    "weekly": "weekly",
+    "hot_weekly": "weekly",
+    "monthly": "monthly",
+    "hot_monthly": "monthly",
+    "quarter": "quarter",
+    "quarterly": "quarter",
+    "hot_quarter": "quarter",
+    "hot_quarterly": "quarter",
+    "half": "half",
+    "half_year": "half",
+    "six_months": "half",
+    "hot_half": "half",
+    "hot_half_year": "half",
+    "hot_six_months": "half",
+}
+# Canonical periods in the order they appear on the website
+HOT_PERIODS = ("daily", "weekly", "monthly", "quarter", "half")
+
 # Next.js embeds data as escaped JSON strings inside chunks like:
 #   self.__next_f.push([1,"...escaped json..."])
 _NEXT_F_CHUNK = re.compile(r'self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)')
@@ -229,6 +253,9 @@ class DefaultOptions:
     CONNECTIONS = 25
     RETRIES = 5
     MAX_COUBS = None
+    # Coub's section timelines (hot/fresh/rising/random) never end, so a
+    # default cap is used when the user didn't specify MAX_COUBS
+    SECTION_LIMIT = 100
     # Format defaults
     V_QUALITY = -1
     A_QUALITY = -1
@@ -302,6 +329,7 @@ class DefaultOptions:
             "CONNECTIONS": (lambda x: isinstance(x, int) and x > 0),
             "RETRIES": (lambda x: isinstance(x, int)),
             "MAX_COUBS": (lambda x: isinstance(x, int) and x > 0 or x is None),
+            "SECTION_LIMIT": (lambda x: isinstance(x, int) and x > 0),
             "V_QUALITY": (lambda x: x in [0, -1]),
             "A_QUALITY": (lambda x: x in [0, -1]),
             "V_MAX": (lambda x: x in ["hd", "sd", "low"]),
@@ -406,7 +434,11 @@ class CustomArgumentParser(argparse.ArgumentParser):
           -e, --search TERM     download search results for the given term
           -m, --community NAME  download coubs from a community
                                   NAME as seen in the URL (e.g. animals-pets)
-          --hot                 download coubs from the hot section (default sorting)
+          --hot                 download coubs from the hot section (monthly)
+          --hot-period PERIOD   hot section period: daily, weekly, monthly,
+                                  quarter, half (implies --hot)
+          --fresh               download coubs from the fresh section
+          --rising              download coubs from the rising section
           --random              download random coubs
           --liked               download your liked coubs (requires --token)
           --bookmarks           download your bookmarked coubs (requires --token)
@@ -431,6 +463,7 @@ class CustomArgumentParser(argparse.ArgumentParser):
           --retries N           number of retries when connection is lost (def: {self.get_default("retries")})
                                   0 to disable, <0 to retry indefinitely
           --limit-num LIMIT     limit max. number of downloaded coubs
+                                  (endless sections default to SECTION_LIMIT)
 
         Format selection:
           --bestvideo           download best available video quality (def)
@@ -499,7 +532,9 @@ class CustomArgumentParser(argparse.ArgumentParser):
           -) Searches
           -) Tags
           -) Communities (incl. Featured & Coub of the Day)
-          -) Hot section
+          -) Hot section (daily, weekly, monthly, quarterly, half-year)
+          -) Fresh section
+          -) Rising section
           -) Random
 
         2. Input Methods
@@ -507,40 +542,47 @@ class CustomArgumentParser(argparse.ArgumentParser):
 
           1) Direct URLs from coub.com (or list paths)
 
-            Single Coub:  https://coub.com/view/1234567
-            List:         path/to/list.txt
-            Channel:      https://coub.com/example-channel
-            Search:       https://coub.com/search?q=example-term
-            Tag:          https://coub.com/tags/example-tag
-            Community:    https://coub.com/community/example-community
-            Hot section:  https://coub.com or https://coub.com/hot
-            Random:       https://coub.com/random
+            Single Coub:    https://coub.com/view/1234567
+            List:           path/to/list.txt
+            Channel:        https://coub.com/example-channel
+            Search:         https://coub.com/search?q=example-term
+            Tag:            https://coub.com/tags/example-tag
+            Community:      https://coub.com/community/example-community
+            Hot section:    https://coub.com or https://coub.com/hot
+                            https://coub.com/hot?period=daily
+            Fresh section:  https://coub.com/fresh
+            Rising section: https://coub.com/rising
+            Random:         https://coub.com/random
 
             URLs which indicate special sort orders are also supported.
 
           2) Input option + channel name/tag/search term/etc.
 
-            Single Coub:  -i 1234567            or  --id 1234567
-            List:         -l path/to/list.txt   or  --list path/to/list.txt
-            Channel:      -c example-channel    or  --channel example-channel
-            Search:       -e example-term       or  --search example-term
-            Tag:          -t example-tag        or  --tag example-tag
-            Community:    -m example-community  or  --community example-community
-            Hot section:  --hot
-            Random:       --random
+            Single Coub:    -i 1234567            or  --id 1234567
+            List:           -l path/to/list.txt   or  --list path/to/list.txt
+            Channel:        -c example-channel    or  --channel example-channel
+            Search:         -e example-term       or  --search example-term
+            Tag:            -t example-tag        or  --tag example-tag
+            Community:      -m example-community  or  --community example-community
+            Hot section:    --hot [--hot-period PERIOD]
+            Fresh section:  --fresh
+            Rising section: --rising
+            Random:         --random or --random#top
 
           3) Prefix + channel name/tag/search term/etc.
 
             A subform of 1). Utilizes the script's ability to autocomplete/format
             incomplete URLs.
 
-            Single Coub:  view/1234567
-            Channel:      example-channel
-            Search:       search?q=example-term
-            Tag:          tags/example-tag
-            Community:    community/example-community
-            Hot section:  hot
-            Random:       random
+            Single Coub:    view/1234567
+            Channel:        example-channel
+            Search:         search?q=example-term
+            Tag:            tags/example-tag
+            Community:      community/example-community
+            Hot section:    hot, hot?period=daily, hot#daily
+            Fresh section:  fresh
+            Rising section: rising
+            Random:         random, random#top
 
         3. Sorting
         ==========
@@ -557,15 +599,17 @@ class CustomArgumentParser(argparse.ArgumentParser):
 
             https://coub.com/search/likes?q=example-term
             https://coub.com/tags/example-tag/views
+            https://coub.com/hot?period=weekly
             https://coub.com/rising
 
           or by adding it manually to the input with '#' as separator
 
             https://coub.com/search?q=example-term#top
             tags/example-tag#views_count
-            hot#rising
+            hot#weekly
 
-          This is supported by all input methods, except the --hot option.
+          This is supported by all input methods. The --hot option has its own
+          equivalent, --hot-period, which doesn't require the '#' notation.
           Please note that a manually specified sort order will overwrite the
           sort order as indicated by the URL.
 
@@ -593,11 +637,8 @@ class CustomArgumentParser(argparse.ArgumentParser):
                               hot_monthly (default)
                               hot_quarterly
                               hot_six_months
-                              rising
-                              fresh
                               top
                               views_count
-                              random
 
             Featured:         recent (default)
             (community)       top_of_the_month
@@ -607,16 +648,20 @@ class CustomArgumentParser(argparse.ArgumentParser):
             (community)       top
                               views_count
 
-            Hot section:      hot_daily
-                              hot_weekly
-                              hot_monthly (default)
-                              hot_quarterly
-                              hot_six_months
-                              rising
-                              fresh
+            Hot section:      daily (also: hot_daily)
+                              weekly (also: hot_weekly)
+                              monthly (default, also: hot_monthly)
+                              quarter (also: quarterly, hot_quarterly)
+                              half (also: six_months, hot_six_months)
+
+            Fresh section:    no sort orders
+            Rising section:   no sort orders
 
             Random:           popular (default)
                               top
+
+          The legacy notation hot#rising and hot#fresh still works and is
+          equivalent to the rising and fresh sections respectively.
         """)
 
         return help_text
@@ -652,6 +697,10 @@ class BaseContainer:
         """Translate the legacy sort order to the new 'order' value (or None)."""
         return self.SORT_TO_ORDER.get(self.sort)
 
+    def sort_label(self):
+        """Human-readable description of the sort order (empty if unset)."""
+        return f"sorted by {self.sort}" if self.sort else ""
+
     def keep_item(self, item):
         """Filter hook for individual timeline items (e.g. reposts)."""
         return True
@@ -662,9 +711,10 @@ class BaseContainer:
         if not self.valid:
             return []
 
+        label = self.sort_label()
         msg(f"\nDownloading {self.type} info"
             f"{f': {self.id}' if self.id else ''}"
-            f"{f' (sorted by {self.sort})' if self.sort else ''}")
+            f"{f' ({label})' if label else ''}")
 
         token = getattr(opts, "auth_token", None)
         ids = []
@@ -801,52 +851,99 @@ class Community(BaseContainer):
 
     def __init__(self, id_):
         super(Community, self).__init__(id_)
-        # Available:      hot_monthly (default), top, views_count
+        # Available:      hot_daily, hot_weekly, hot_monthly (default),
+        #                 hot_quarterly, hot_six_months, top, views_count
         # Note: 'featured'/'coub-of-the-day' are not exposed by the new API.
         if not self.sort:
             self.sort = "hot_monthly"
+        self.sort = HOT_PERIOD_ALIASES.get(self.sort, self.sort)
 
     def get_query(self):
         query = f"kind={self.kind}&community={urlquote(self.id)}"
         order = self.order_param()
-        return f"{query}&order={order}" if order else query
+        if order:
+            query = f"{query}&order={order}"
+        period = HOT_PERIOD_ALIASES.get(self.sort)
+        if period:
+            query = f"{query}&period={period}"
+        return query
+
+    def sort_label(self):
+        if self.sort in HOT_PERIOD_ALIASES.values():
+            return f"period: {self.sort}"
+        return super(Community, self).sort_label()
 
 
-class HotSection(BaseContainer):
+class SiteSection(BaseContainer):
+    """Base class for site-wide timelines (hot, fresh, rising, random)."""
+
+    type = None
+    kind = None
+    SORTS = ()
+    DEFAULT_SORT = None
+
+    def __init__(self, sort=None):
+        super(SiteSection, self).__init__(self.kind)
+        self.id = None
+        self.sort = sort or self.DEFAULT_SORT
+        if self.sort not in self.SORTS:
+            err(f"\nInvalid {self.type} sort order '{self.sort}'!",
+                color=fgcolors.WARNING)
+            self.valid = False
+
+    def get_query(self):
+        return f"kind={self.kind}"
+
+
+class HotSection(SiteSection):
     """Store and parse the hot section."""
+
     type = "hot section"
     kind = "hot"
+    DEFAULT_SORT = "monthly"
+    # Legacy sort names are accepted as aliases for the site's periods
+    SORTS = tuple(HOT_PERIOD_ALIASES)
 
     def __init__(self, sort=None):
-        super(HotSection, self).__init__("hot")
-        self.id = None
-        self.sort = sort
-        # Available:      hot_daily, hot_weekly, hot_monthly, hot_quarterly,
-        #                 hot_six_months, rising, fresh
-        # Coub's default: hot_monthly (no order param)
-        if not self.sort:
-            self.sort = "hot_monthly"
+        if sort:
+            sort = HOT_PERIOD_ALIASES.get(sort, sort)
+        super(HotSection, self).__init__(sort)
 
     def get_query(self):
-        return f"kind={self.kind}"
+        return f"kind={self.kind}&period={self.sort}"
+
+    def sort_label(self):
+        return f"period: {self.sort}"
 
 
-class RandomCategory(BaseContainer):
+class FreshSection(SiteSection):
+    """Store and parse the fresh section."""
+
+    type = "fresh section"
+    kind = "fresh"
+    SORTS = (None,)
+
+
+class RisingSection(SiteSection):
+    """Store and parse the rising section."""
+
+    type = "rising section"
+    kind = "rising"
+    SORTS = (None,)
+
+
+class RandomCategory(SiteSection):
     """Store and parse the random category."""
+
     type = "random"
     kind = "random"
-
-    def __init__(self, sort=None):
-        super(RandomCategory, self).__init__("random")
-        self.id = None
-        self.sort = sort
-        # Available:      popular, top
-        # Coub's default: popular (no order param)
-        if not self.sort:
-            self.sort = "popular"
+    DEFAULT_SORT = "popular"
+    SORTS = ("popular", "top")
+    SORT_TO_ORDER = {"top": "top"}
 
     def get_query(self):
-        return f"kind={self.kind}"
+        order = self.order_param()
+        return f"kind={self.kind}&order={order}" if order else f"kind={self.kind}"
 
 
 class UserScoped(BaseContainer):
@@ -1209,6 +1306,14 @@ def positive_int(string):
     return value
 
 
+def hot_period(string):
+    """Normalize a hot period name (legacy aliases are accepted)."""
+    value = HOT_PERIOD_ALIASES.get(string.lower())
+    if value is None:
+        raise argparse.ArgumentTypeError("invalid hot period")
+    return value
+
+
 def valid_time(string):
     """Test valditiy of time syntax with FFmpeg."""
     # Gets called in parse_cli, so opts.ffmpeg_path isn't available yet
@@ -1321,12 +1426,18 @@ def normalize_link(string):
                     sort = to_replace['search'][r]
                 info = f"{parts[0]}{parts[2]}"
     elif "community/" in info:
+        period = ""
+        if "period=" in info:
+            period = info.partition("period=")[2].split("&")[0]
+            info = info.partition("?")[0]
         for r in to_replace['community']:
             parts = info.partition(r)
             if parts[1]:
                 if not sort:
                     sort = to_replace['community'][r]
                 info = parts[0]
+        if period and not sort:
+            sort = HOT_PERIOD_ALIASES.get(period, period)
     elif "featured" in info:
         for r in to_replace['featured']:
             parts = info.partition(r)
@@ -1341,6 +1452,15 @@ def normalize_link(string):
                 if not sort:
                     sort = to_replace['random'][r]
                 info = parts[0]
+    # https://coub.com/hot?period=daily -> hot#daily
+    elif info == "hot" or info.startswith("hot?"):
+        period = ""
+        if "period=" in info:
+            period = info.partition("period=")[2].split("&")[0]
+            period = HOT_PERIOD_ALIASES.get(period, period)
+        if period in HOT_PERIOD_ALIASES.values() and not sort:
+            sort = period
+        info = "hot"
     # These are the 2 special cases for the hot section
     elif info in ("rising", "fresh"):
         if not sort:
@@ -1399,7 +1519,12 @@ def mapped_input(string):
             _, sort = link.split("#")
         except ValueError:
             sort = None
-        source = HotSection(sort)
+        if sort == "rising":
+            source = RisingSection()
+        elif sort == "fresh":
+            source = FreshSection()
+        else:
+            source = HotSection(sort)
     # Unfortunately channel URLs don't have any special characteristics
     # and are basically the fallthrough link type
     else:
@@ -1428,8 +1553,15 @@ def parse_cli():
                         type=Search)
     parser.add_argument("-m", "--community", dest="input", action="append",
                         type=Community)
-    parser.add_argument("--hot", dest="input", action="append_const",
-                        const=HotSection())
+    hot = HotSection()      # period may be overridden by --hot-period
+    parser.add_argument("--hot", dest="input", action="append_const", const=hot)
+    parser.add_argument("--hot-period", dest="hot_period", type=hot_period,
+                        choices=HOT_PERIODS, default=None, metavar="PERIOD",
+                        help="hot section period (implies --hot)")
+    parser.add_argument("--fresh", dest="input", action="append_const",
+                        const=FreshSection())
+    parser.add_argument("--rising", dest="input", action="append_const",
+                        const=RisingSection())
     parser.add_argument("--random", "--random#popular", dest="input",
                         action="append_const", const=RandomCategory())
     parser.add_argument("--random#top", dest="input", action="append_const",
@@ -1519,6 +1651,7 @@ def parse_cli():
     parser.set_defaults(
         ffmpeg_path=defaults.FFMPEG_PATH,
         coubs_per_page=defaults.COUBS_PER_PAGE,
+        section_limit=defaults.SECTION_LIMIT,
         tag_sep=defaults.TAG_SEP,
         fallback_char=defaults.FALLBACK_CHAR,
         write_method=defaults.WRITE_METHOD,
@@ -1536,6 +1669,11 @@ def parse_cli():
         args.input.extend(args.raw_input)
     else:
         args.input = args.raw_input
+    # --hot-period also implies the hot section when --hot wasn't given
+    if args.hot_period:
+        hot.sort = args.hot_period
+        if hot not in args.input:
+            args.input.append(hot)
     # Read archive content
     if args.archive and os.path.exists(args.archive):
         with open(args.archive, "r") as f:
@@ -1603,6 +1741,16 @@ def parse_input(sources):
         msg("\nReading command line:")
         msg(f"  {len(parsed)} link{'s' if len(parsed) != 1 else ''} found")
 
+    # Coub's section timelines are endless, so they need a quantity limit.
+    # Fall back to SECTION_LIMIT when the user didn't set --limit-num.
+    section_limit = None
+    if not opts.max_coubs and any(isinstance(c, SiteSection) for c in containers):
+        section_limit = getattr(opts, "section_limit", DefaultOptions.SECTION_LIMIT)
+        msg(f"\nNote: section timelines are endless, parsing at most "
+            f"{section_limit} coubs per section",
+            color=fgcolors.WARNING)
+        msg("      (change this with --limit-num or SECTION_LIMIT in coub.conf)")
+
     # And now all containers
     for c in containers:
         if opts.max_coubs:
@@ -1610,6 +1758,8 @@ def parse_input(sources):
             if not rest:
                 break
             parsed.extend(asyncio.run(c.process(rest)))
+        elif section_limit is not None and isinstance(c, SiteSection):
+            parsed.extend(asyncio.run(c.process(section_limit)))
         else:
             parsed.extend(asyncio.run(c.process()))
 

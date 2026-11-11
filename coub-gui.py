@@ -41,6 +41,14 @@ class GuiDefaultOptions(coub.DefaultOptions):
     QUALITY_LABEL = ["Worst quality", "Best quality"]
     AAC_LABEL = ["Only MP3", "No Bias", "Prefer AAC", "Only AAC"]
     RECOUB_LABEL = ["No Recoubs", "With Recoubs", "Only Recoubs"]
+    HOT_PERIOD_LABEL = ["Daily", "Weekly", "Monthly", "Quarterly", "Six months"]
+    HOT_PERIOD_VALUE = {
+        "Daily": "daily",
+        "Weekly": "weekly",
+        "Monthly": "monthly",
+        "Quarterly": "quarter",
+        "Six months": "half",
+    }
     SPECIAL_LABEL = {
         (False, False, False): "None",
         (True, False, False): "Share",
@@ -82,6 +90,7 @@ def translate_to_cli(options):
     options.a_quality = QUALITY_LABEL[options.a_quality]
     options.aac = AAC_LABEL[options.aac]
     options.recoubs = RECOUB_LABEL[options.recoubs]
+    options.hot_period = GuiDefaultOptions.HOT_PERIOD_VALUE[options.hot_period]
     options.share, options.v_only, options.a_only = SPECIAL_LABEL[options.special]
 
     return options
@@ -236,10 +245,17 @@ def parse_cli():
     input_.add_argument("--lists", default="", widget="MultiFileChooser",
                         metavar="Link Lists", help="Read coub links from input lists",
                         gooey_options={'message': "Choose link lists"})
-    input_.add_argument("--random", action="count", metavar="Random",
-                        help="Download N*1000 randomly generated coubs")
     input_.add_argument("--hot", action="store_true", widget="BlockCheckbox",
                         metavar="Hot Section", help="Download coubs from the hot section")
+    input_.add_argument("--hot-period", choices=defs.HOT_PERIOD_LABEL,
+                        default="Monthly", metavar="Hot Period",
+                        help="Period of the hot section (used when Hot Section is checked)")
+    input_.add_argument("--fresh", action="store_true", widget="BlockCheckbox",
+                        metavar="Fresh Section", help="Download coubs from the fresh section")
+    input_.add_argument("--rising", action="store_true", widget="BlockCheckbox",
+                        metavar="Rising Section", help="Download coubs from the rising section")
+    input_.add_argument("--random", choices=["Off", "Popular", "Top"], default="Off",
+                        metavar="Random", help="Download random coubs")
 
     # Account
     account = parser.add_argument_group(
@@ -303,7 +319,9 @@ def parse_cli():
                                "(<0 for infinite retries)")
     download.add_argument("--max-coubs", type=coub.positive_int,
                           default=defs.MAX_COUBS, metavar="Limit Quantity",
-                          help="How many coub links to parse")
+                          help="How many coub links to parse "
+                               "(hot/fresh/rising/random are endless; "
+                               "SECTION_LIMIT applies when empty)")
 
     # Format Selection
     formats = parser.add_argument_group("Format", gooey_options={'columns': 1})
@@ -366,6 +384,7 @@ def parse_cli():
         verbosity=1,
         ffmpeg_path=defs.FFMPEG_PATH,
         coubs_per_page=defs.COUBS_PER_PAGE,   # allowed: 1-25
+        section_limit=defs.SECTION_LIMIT,
         tag_sep=defs.TAG_SEP,
         fallback_char=defs.FALLBACK_CHAR,
         write_method=defs.WRITE_METHOD,       # w -> overwrite, a -> append
@@ -391,10 +410,14 @@ def parse_cli():
     args.input.extend([coub.Search(s) for s in args.searches.split(",") if s])
     args.input.extend([coub.Community(c) for c in args.communities.split(",") if c])
     if args.hot:
-        args.input.append(coub.HotSection())
-    if args.random:
-        for _ in range(args.random):
-            args.input.append(coub.RandomCategory())
+        period = GuiDefaultOptions.HOT_PERIOD_VALUE[args.hot_period]
+        args.input.append(coub.HotSection(period))
+    if args.fresh:
+        args.input.append(coub.FreshSection())
+    if args.rising:
+        args.input.append(coub.RisingSection())
+    if args.random != "Off":
+        args.input.append(coub.RandomCategory(args.random.lower()))
     if args.liked:
         args.input.append(coub.UserScoped("likes"))
     if args.bookmarks:

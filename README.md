@@ -6,7 +6,7 @@ CoubDownloader is a simple script to download videos (called coubs) from [Coub](
 
 ## Changes in this fork
 
-* **New Coub API** — ported from the legacy `/api/v2` endpoints to the current `coub-site` API (`/api/coub-site/timeline`). Channels, tags, searches, communities, hot and random sections work again.
+* **New Coub API** — ported from the legacy `/api/v2` endpoints to the current `coub-site` API (`/api/coub-site/timeline`). Channels, tags, searches, communities, hot (daily/weekly/monthly/quarterly/six months), fresh, rising and random sections work again.
 * **Account support** — paste the value of the `sb-gotrue-auth-token` cookie (starts with `base64-`) into the GUI's *Account* tab to download your **liked** and **bookmarked** coubs, your **own channel** and **private coubs**.
 * **GUI settings persistence** — the GUI saves your settings (output path, container, name template, quality/format options, etc.) to `coub.conf` next to the executable, so they survive restarts and even crashes.
 * **Self-contained Windows exe** — standalone builds bundle FFmpeg, so no separate FFmpeg install is required.
@@ -32,6 +32,8 @@ CoubDownloader is a simple script to download videos (called coubs) from [Coub](
     7. [Tags](#tags)
     8. [Communities](#communities)
     9. [Hot section](#hot-section)
+    10. [Fresh section](#fresh-section)
+    11. [Rising section](#rising-section)
 6. [GUI](#gui)
 7. [Misc. information](#misc-information)
     1. [Video resolution vs. quality](#video-resolution-vs-quality)
@@ -55,7 +57,11 @@ Input:
   -e, --search TERM     download search results for the given term
   -m, --community NAME  download coubs from a community
                           NAME as seen in the URL (e.g. animals-pets)
-  --hot                 download coubs from the hot section (default sorting)
+  --hot                 download coubs from the hot section (monthly)
+  --hot-period PERIOD   hot section period: daily, weekly, monthly,
+                          quarter, half (implies --hot)
+  --fresh               download coubs from the fresh section
+  --rising              download coubs from the rising section
   --random              download random coubs
   --input-help          show full input help
 
@@ -78,6 +84,7 @@ Download options:
   --retries N           number of retries when connection is lost (def: 5)
                           0 to disable, <0 to retry indefinitely
   --limit-num LIMIT     limit max. number of downloaded coubs
+                          (endless sections default to SECTION_LIMIT)
 
 Format selection:
   --bestvideo           download best available video quality (def)
@@ -192,7 +199,9 @@ Contents
   -) Searches
   -) Tags
   -) Communities (incl. Featured & Coub of the Day)
-  -) Hot section
+  -) Hot section (daily, weekly, monthly, quarterly, half-year)
+  -) Fresh section
+  -) Rising section
   -) Random
   -) Liked coubs (CLI: --liked, requires --token)
   -) Bookmarks (CLI: --bookmarks, requires --token)
@@ -202,40 +211,47 @@ Contents
 
   1) Direct URLs from coub.com (or list paths)
 
-    Single Coub:  https://coub.com/view/1234567
-    List:         path/to/list.txt
-    Channel:      https://coub.com/example-channel
-    Search:       https://coub.com/search?q=example-term
-    Tag:          https://coub.com/tags/example-tag
-    Community:    https://coub.com/community/example-community
-    Hot section:  https://coub.com or https://coub.com/hot
-    Random:       https://coub.com/random
+    Single Coub:    https://coub.com/view/1234567
+    List:           path/to/list.txt
+    Channel:        https://coub.com/example-channel
+    Search:         https://coub.com/search?q=example-term
+    Tag:            https://coub.com/tags/example-tag
+    Community:      https://coub.com/community/example-community
+    Hot section:    https://coub.com or https://coub.com/hot
+                    https://coub.com/hot?period=daily
+    Fresh section:  https://coub.com/fresh
+    Rising section: https://coub.com/rising
+    Random:         https://coub.com/random
 
     URLs which indicate special sort orders are also supported.
 
   2) Input option + channel name/tag/search term/etc.
 
-    Single Coub:  -i 1234567            or  --id 1234567
-    List:         -l path/to/list.txt   or  --list path/to/list.txt
-    Channel:      -c example-channel    or  --channel example-channel
-    Search:       -e example-term       or  --search example-term
-    Tag:          -t example-tag        or  --tag example-tag
-    Community:    -m example-community  or  --community example-community
-    Hot section:  --hot
-    Random:       --random
+    Single Coub:    -i 1234567            or  --id 1234567
+    List:           -l path/to/list.txt   or  --list path/to/list.txt
+    Channel:        -c example-channel    or  --channel example-channel
+    Search:         -e example-term       or  --search example-term
+    Tag:            -t example-tag        or  --tag example-tag
+    Community:      -m example-community  or  --community example-community
+    Hot section:    --hot [--hot-period PERIOD]
+    Fresh section:  --fresh
+    Rising section: --rising
+    Random:         --random or --random#top
 
   3) Prefix + channel name/tag/search term/etc.
 
     A subform of 1). Utilizes the script's ability to autocomplete/format
     incomplete URLs.
 
-    Single Coub:  view/1234567
-    Channel:      example-channel
-    Search:       search?q=example-term
-    Tag:          tags/example-tag
-    Community:    community/example-community
-    Hot section:  hot
-    Random:       random
+    Single Coub:    view/1234567
+    Channel:        example-channel
+    Search:         search?q=example-term
+    Tag:            tags/example-tag
+    Community:      community/example-community
+    Hot section:    hot, hot?period=daily, hot#daily
+    Fresh section:  fresh
+    Rising section: rising
+    Random:         random, random#top
 
 3. Sorting
 ==========
@@ -252,15 +268,17 @@ Contents
 
     https://coub.com/search/likes?q=example-term
     https://coub.com/tags/example-tag/views
+    https://coub.com/hot?period=weekly
     https://coub.com/rising
 
   or by adding it manually to the input with '#' as separator
 
     https://coub.com/search?q=example-term#top
     tags/example-tag#views_count
-    hot#rising
+    hot#weekly
 
-  This is supported by all input methods, except the --hot option.
+  This is supported by all input methods. The --hot option has its own
+  equivalent, --hot-period, which doesn't require the '#' notation.
   Please note that a manually specified sort order will overwrite the
   sort order as indicated by the URL.
 
@@ -288,11 +306,8 @@ Contents
                       hot_monthly (default)
                       hot_quarterly
                       hot_six_months
-                      rising
-                      fresh
                       top
                       views_count
-                      random
 
     Featured:         recent (default)
     (community)       top_of_the_month
@@ -302,16 +317,20 @@ Contents
     (community)       top
                       views_count
 
-    Hot section:      hot_daily
-                      hot_weekly
-                      hot_monthly (default)
-                      hot_quarterly
-                      hot_six_months
-                      rising
-                      fresh
+    Hot section:      daily (also: hot_daily)
+                      weekly (also: hot_weekly)
+                      monthly (default, also: hot_monthly)
+                      quarter (also: quarterly, hot_quarterly)
+                      half (also: six_months, hot_six_months)
+
+    Fresh section:    no sort orders
+    Rising section:   no sort orders
 
     Random:           popular (default)
                       top
+
+  The legacy notation hot#rising and hot#fresh still works and is
+  equivalent to the rising and fresh sections respectively.
 
 ```
 
@@ -355,13 +374,11 @@ Using general search terms can potentially return tens of thousands of coub link
 
 #### Random
 
-Provides a random collection of coubs. A request returns max. 1000 coubs, but several requests can be made during one script invocation (e.g. using the --random option thrice).
+Provides an endless stream of random coubs (popular by default, or top via `--random#top` and the GUI's *Random* dropdown).
 
 ***
 
-The now following input types only return a limited number of links. This is indirectly enforced by the API, although I can't say if it is done on purpose or a bug (pages >99 redirect to page 1).
-
-Each of the following input types provides at most 2475 direct links.
+Coub's timelines use infinite scroll, so the hot, fresh, rising and random sections never end. They are parsed up to `--limit-num`, or up to `SECTION_LIMIT` from `coub.conf` (default: 100) when no explicit limit is given.
 
 ***
 
@@ -403,16 +420,30 @@ The default sort order for most communities (most popular coubs of the month) ma
 
 #### Hot section
 
-The currently most popular/trending coubs.
+The currently most popular/trending coubs. The period matches the selector on Coub's website:
+
+* Daily — `https://coub.com/hot?period=daily`, `hot#daily`, `--hot-period daily`
+* Weekly — `https://coub.com/hot?period=weekly`, `hot#weekly`, `--hot-period weekly`
+* Monthly (default) — `https://coub.com/hot`, `hot#monthly`, `--hot`
+* Quarterly — `https://coub.com/hot?period=quarter`, `hot#quarter`, `--hot-period quarter`
+* Six months — `https://coub.com/hot?period=half`, `hot#half`, `--hot-period half`
 
 Both
 
 * [https://coub.com/hot](https://coub.com/hot)
 * [https://coub.com](https://coub.com)
 
-refer to the hot section and can be used as input.
+refer to the hot section and can be used as input. `--hot` uses the monthly period; `--hot-period PERIOD` implies `--hot`.
 
-The default sort order (most popular coubs of the month) may provide less results than other sort orders.
+The legacy sort names (`hot_daily`, `hot_weekly`, `hot_monthly`, `hot_quarterly`, `hot_six_months`) are still accepted as aliases, and `hot#rising` / `hot#fresh` map to the sections below.
+
+#### Fresh section
+
+The newest coubs, as on [https://coub.com/fresh](https://coub.com/fresh). Use `--fresh`, the URL, or the `fresh` prefix. There are no sort orders.
+
+#### Rising section
+
+Coubs that are quickly gaining traction, as on [https://coub.com/rising](https://coub.com/rising). Use `--rising`, the URL, or the `rising` prefix. There are no sort orders.
 
 ## GUI
 
@@ -426,8 +457,9 @@ It provides the same functionality as the main CLI tool, with a few notable exce
 
 * No quiet mode
 * No overwrite prompt (default prompt answer is set to "no")
-* No option equivalent to `--random#top` (direct URL input must be used)
 * The output path defaults to "coubs" in the user's home directory instead of the current one
+
+The *Input* tab exposes the sections directly: tick *Hot Section* and pick a period (daily to six months), or tick *Fresh Section*, *Rising Section* and pick a *Random* order (popular/top).
 
 The GUI adds an **Account** tab with these fields:
 
