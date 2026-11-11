@@ -56,6 +56,28 @@ except ModuleNotFoundError:
         colors = False
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Path Helpers (script vs. frozen executable)
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+def app_dir():
+    """Directory of the running app (exe folder when frozen, else script dir)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.realpath(sys.executable))
+    return os.path.dirname(os.path.realpath(__file__))
+
+
+def resolve_ffmpeg(path):
+    """Prefer a bundled/local ffmpeg.exe over a PATH lookup."""
+    if path == "ffmpeg":
+        # In frozen builds the bundled binary sits next to this module
+        # (PyInstaller's extraction dir), so it works without a system FFmpeg
+        local = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ffmpeg.exe")
+        if os.path.exists(local):
+            return local
+    return path
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Classes For Global Variables
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -240,8 +262,8 @@ class DefaultOptions:
 
     def __init__(self, config_dirs=None):
         if not config_dirs:
-            # Only supports script's location as default for now
-            config_dirs = [os.path.dirname(os.path.realpath(__file__))]
+            # Read the config next to the executable (frozen) or next to the script
+            config_dirs = [app_dir()]
         for d in config_dirs:
             config_path = os.path.join(d, "coub.conf")
             if os.path.exists(config_path):
@@ -1144,15 +1166,11 @@ def msg(*args, color=fgcolors.RESET, **kwargs):
 
 def check_prereq():
     """Test if all required 3rd-party tools are installed."""
-    ffmpeg_path = opts.ffmpeg_path
-    # Prefer a local ffmpeg.exe next to the script (Windows convenience)
-    local = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ffmpeg.exe")
-    if ffmpeg_path == "ffmpeg" and os.path.exists(local):
-        ffmpeg_path = local
-        opts.ffmpeg_path = local
+    # Prefer a bundled/local ffmpeg.exe (frozen builds) over one from PATH
+    opts.ffmpeg_path = resolve_ffmpeg(opts.ffmpeg_path)
 
     try:
-        subprocess.run([ffmpeg_path],
+        subprocess.run([opts.ffmpeg_path],
                        stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL,
                        check=False)
@@ -1197,7 +1215,7 @@ def valid_time(string):
     # Exploits the fact that advanced defaults and options are always the same
     defaults = DefaultOptions()
     command = [
-        defaults.FFMPEG_PATH, "-v", "quiet",
+        resolve_ffmpeg(defaults.FFMPEG_PATH), "-v", "quiet",
         "-f", "lavfi", "-i", "anullsrc",
         "-t", string, "-c", "copy",
         "-f", "null", "-",
@@ -1206,6 +1224,8 @@ def valid_time(string):
         subprocess.check_call(command)
     except subprocess.CalledProcessError:
         raise argparse.ArgumentTypeError("invalid time syntax")
+    except FileNotFoundError:
+        raise argparse.ArgumentTypeError("FFmpeg not found")
 
     return string
 
