@@ -77,6 +77,15 @@ def resolve_ffmpeg(path):
     return path
 
 
+# FFmpeg (and the user's preview command) are console programs. Started from
+# the windowed GUI build or pythonw.exe they would each open a console window,
+# so every child process is created without one. Console builds are unaffected:
+# their standard streams are still inherited and work as before.
+no_window = {}
+if os.name == "nt":
+    no_window["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Classes For Global Variables
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1138,7 +1147,7 @@ class Coub:
                 command.extend(["-t", opts.duration])
             command.extend(["-c", "copy", "-shortest", f"file:temp_{m_name}"])
 
-            subprocess.run(command, check=False)
+            subprocess.run(command, check=False, **no_window)
         finally:
             if os.path.exists(t_name):
                 os.remove(t_name)
@@ -1178,7 +1187,8 @@ class Coub:
             command = opts.preview.split(" ")
             command.append(play)
             subprocess.check_call(command, stdout=subprocess.DEVNULL, \
-                                           stderr=subprocess.DEVNULL)
+                                           stderr=subprocess.DEVNULL,
+                                           **no_window)
         except (subprocess.CalledProcessError, FileNotFoundError):
             err("Warning: Preview command failed!", color=fgcolors.WARNING)
 
@@ -1270,7 +1280,8 @@ def check_prereq():
         subprocess.run([opts.ffmpeg_path],
                        stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL,
-                       check=False)
+                       check=False,
+                       **no_window)
     except FileNotFoundError:
         err("Error: FFmpeg not found!")
         sys.exit(status.DEP)
@@ -1326,7 +1337,7 @@ def valid_time(string):
         "-f", "null", "-",
     ]
     try:
-        subprocess.check_call(command)
+        subprocess.check_call(command, **no_window)
     except subprocess.CalledProcessError:
         raise argparse.ArgumentTypeError("invalid time syntax")
     except FileNotFoundError:
@@ -1949,7 +1960,8 @@ def valid_stream(path, attempted_fix=False):
         "-t", "1",
         "-f", "null", "-",
     ]
-    out = subprocess.run(command, capture_output=True, text=True, check=False)
+    out = subprocess.run(command, capture_output=True, text=True, check=False,
+                         **no_window)
 
     # Fix broken video stream
     if "moov atom not found" in out.stderr and not attempted_fix:
